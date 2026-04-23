@@ -6,6 +6,7 @@ use std::env;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
@@ -24,6 +25,8 @@ struct AppState {
     routes: Arc<Vec<DomainRoute>>,
     token: String,
     sessions: Arc<RwLock<HashMap<String, String>>>,
+    ip_connections: Arc<RwLock<HashMap<String, Vec<Instant>>>>,
+    max_connections_per_ip: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -32,15 +35,6 @@ struct AuthMessage {
     msg_type: String,
     token: String,
     domain: Option<String>,
-}
-
-#[derive(Serialize)]
-struct WssMessage {
-    #[serde(rename = "type")]
-    msg_type: String,
-    session_id: Option<String>,
-    #[serde(flatten)]
-    extra: Option<serde_json::Value>,
 }
 
 fn parse_routes(routes_str: &str) -> Vec<DomainRoute> {
@@ -85,10 +79,37 @@ fn validate_10_network(target: &str) -> Result<bool> {
 }
 
 const BUFFER_SIZE: usize = 65536;
+const CONNECTION_WINDOW_SECS: u64 = 60;
+
+async fn check_rate_limit(state: &AppState, ip: &str) -> Result<()> {
+    let now = Instant::now();
+    let window = Duration::from_secs(CONNECTION_WINDOW_SECS);
+
+    {
+        let mut connections = state.ip_connections.write().await;
+        
+        connections.retain(|_, times| {
+            times.retain(|&t| t + window > now);
+            !times.is_empty()
+        });
+
+        let count = connections.get(ip).map(|v| v.len()).unwrap_or(0);
+        
+        if count >= state.max_connections_per_ip {
+            anyhow::bail!("Rate limit exceeded: {} connections from {} in last {}s", 
+                count, ip, CONNECTION_WINDOW_SECS);
+        }
+
+        connections.entry(ip.to_string()).or_default().push(now);
+    }
+
+    Ok(())
+}
 
 async fn handle_connection(
     ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
     state: Arc<AppState>,
+    client_ip: &str,
 ) -> Result<()> {
     let (mut ws_sender, mut ws_receiver) = ws.split();
     let mut session_id = String::new();
@@ -145,7 +166,7 @@ async fn handle_connection(
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to send OK: {}", e))?;
 
-                println!("[{}] [{}] Connected", session_id, domain);
+                println!("[{}] [{}] [{}] Connected", session_id, domain, client_ip);
 
                 let mut outbound = tokio::net::TcpStream::connect(&target_addr)
                     .await
@@ -217,16 +238,23 @@ async fn main() -> Result<()> {
     let listen = env::var("WSS_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let routes_str = env::var("WSS_ROUTES").expect("WSS_ROUTES not set");
     let token = env::var("WSS_TOKEN").expect("WSS_TOKEN not set");
+    let max_connections: usize = env::var("WSS_MAX_CONNECTIONS")
+        .unwrap_or_else(|_| "100".to_string())
+        .parse()
+        .unwrap_or(100);
 
     let routes = Arc::new(parse_routes(&routes_str));
     let state = Arc::new(AppState {
         routes,
         token: token.clone(),
         sessions: Arc::new(RwLock::new(HashMap::new())),
+        ip_connections: Arc::new(RwLock::new(HashMap::new())),
+        max_connections_per_ip: max_connections,
     });
 
     let token_shown = format!("{}***", &token[..4.min(token.len())]);
     println!("Token configured: {}", token_shown);
+    println!("Max connections per IP: {}", max_connections);
     println!("Routes: {:?}", state.routes);
 
     let addr: SocketAddr = listen.parse()?;
@@ -237,17 +265,23 @@ async fn main() -> Result<()> {
 
     loop {
         let (stream, addr) = listener.accept().await?;
+        let client_ip = addr.ip().to_string();
         let state = state.clone();
 
         tokio::spawn(async move {
+            if let Err(e) = check_rate_limit(&state, &client_ip).await {
+                eprintln!("[{}] Rate limit exceeded", client_ip);
+                return;
+            }
+
             match accept_async(stream).await {
                 Ok(ws) => {
-                    if let Err(e) = handle_connection(ws, state).await {
-                        eprintln!("Connection error {}: {}", addr, e);
+                    if let Err(e) = handle_connection(ws, state, &client_ip).await {
+                        eprintln!("Connection error {}: {}", client_ip, e);
                     }
                 }
                 Err(e) => {
-                    eprintln!("Accept error {}: {}", addr, e);
+                    eprintln!("Accept error {}: {}", client_ip, e);
                 }
             }
         });
