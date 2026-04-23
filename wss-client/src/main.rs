@@ -3,6 +3,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use std::env;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, stdin, stdout};
+use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 #[derive(Serialize)]
@@ -13,27 +14,24 @@ struct AuthMessage {
     domain: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let relay_url = env::var("WSS_RELAY_URL")
-        .expect("WSS_RELAY_URL not set");
-    let domain = env::var("WSS_DOMAIN")
-        .expect("WSS_DOMAIN not set");
-    let token = env::var("WSS_TOKEN")
-        .expect("WSS_TOKEN not set");
+const MAX_RETRIES: u32 = 0;
+const INITIAL_BACKOFF_MS: u64 = 1000;
+const MAX_BACKOFF_MS: u64 = 30000;
 
-    println!("Connecting to relay: {}", relay_url);
-    println!("Tunneling domain: {}", domain);
-
-    let (ws_stream, _) = connect_async(&relay_url).await
+async fn connect_and_tunnel(
+    relay_url: &str,
+    domain: &str,
+    token: &str,
+) -> Result<()> {
+    let (ws_stream, _) = connect_async(relay_url).await
         .map_err(|e| anyhow::anyhow!("Failed to connect: {}", e))?;
 
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
     let auth = AuthMessage {
         msg_type: "auth".to_string(),
-        token,
-        domain: domain.clone(),
+        token: token.to_string(),
+        domain: domain.to_string(),
     };
     let auth_json = serde_json::to_string(&auth)
         .map_err(|e| anyhow::anyhow!("Failed to serialize auth: {}", e))?;
@@ -52,7 +50,7 @@ async fn main() -> Result<()> {
         anyhow::bail!("Authentication failed: {}", resp_text);
     }
 
-    println!("Authenticated! Tunnel open.");
+    println!("Tunnel open.");
 
     let mut stdin = stdin();
     let mut stdout = stdout();
@@ -88,6 +86,48 @@ async fn main() -> Result<()> {
     };
 
     tokio::try_join!(stdin_to_ws, ws_to_stdout)?;
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let relay_url = env::var("WSS_RELAY_URL")
+        .expect("WSS_RELAY_URL not set");
+    let domain = env::var("WSS_DOMAIN")
+        .expect("WSS_DOMAIN not set");
+    let token = env::var("WSS_TOKEN")
+        .expect("WSS_TOKEN not set");
+
+    println!("Connecting to relay: {}", relay_url);
+    println!("Tunneling domain: {}", domain);
+    println!("Press Ctrl+C to exit");
+
+    let mut retries = 0u32;
+    let mut backoff_ms = INITIAL_BACKOFF_MS;
+
+    loop {
+        match connect_and_tunnel(&relay_url, &domain, &token).await {
+            Ok(_) => {
+                println!("Tunnel closed cleanly.");
+                break;
+            }
+            Err(e) => {
+                if MAX_RETRIES > 0 && retries >= MAX_RETRIES {
+                    eprintln!("Max retries ({}) reached. Giving up.", MAX_RETRIES);
+                    break;
+                }
+
+                retries += 1;
+                eprintln!("Error: {}. Reconnecting in {}ms (attempt {})...", 
+                    e, backoff_ms, retries);
+
+                sleep(Duration::from_millis(backoff_ms)).await;
+
+                backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+            }
+        }
+    }
 
     Ok(())
 }
