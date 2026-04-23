@@ -1,6 +1,18 @@
 # WSS - WebSocket Tunnel
 
-Secure WebSocket tunnel with domain-based routing and 10.x.x.x enforcement.
+A production-grade WebSocket tunnel with domain-based routing, authentication, and security features.
+
+## Features
+
+| Feature | Description |
+|---------|-------------|
+| 🔒 **10.x.x.x Validation** | Proper IP parsing (not just string prefix) |
+| 🔐 **Token Authentication** | Server/client token-based auth |
+| 🔁 **Auto Reconnect** | Exponential backoff on disconnect |
+| 🆔 **Session ID** | Unique ID per connection for debugging |
+| 📊 **Rate Limiting** | Max connections per IP |
+| ⚡ **High Performance** | 64KB buffers, 300Mbps+ throughput |
+| 🐳 **Docker Ready** | Multi-stage build for small images |
 
 ## Architecture
 
@@ -13,10 +25,11 @@ Secure WebSocket tunnel with domain-based routing and 10.x.x.x enforcement.
 ┌───────────────────────────────────────────────────────┐
 │                   wss-server                         │
 │  (Docker)                                          │
-│  - TLS termination: nginx/traefik (port 443)       │
+│  - TLS: nginx/traefik (port 443 → 8080)            │
 │  - Plain WS: wss-server (port 8080)                  │
-│  - Domain routing: domain → 10.x.x.x:443            │
-│  - Enforce: target must be 10.x.x.x               │
+│  - Domain routing: domain → 10.x.x.x               │
+│  - Authentication: token required                   │
+│  - Rate limiting: max connections per IP            │
 └───────────────────────────────────────────────────────┘
                        │
                        │ TCP
@@ -30,7 +43,7 @@ Secure WebSocket tunnel with domain-based routing and 10.x.x.x enforcement.
 
 ## Quick Start
 
-### 1. wss-server (Docker)
+### 1. Run Server (Docker)
 
 ```bash
 # Build
@@ -41,29 +54,12 @@ docker build -t wss-server .
 # Run
 docker run -p 8080:8080 \
   -e WSS_ROUTES="app.internal=10.0.0.1:443" \
+  -e WSS_TOKEN="your-secret-token" \
+  -e WSS_MAX_CONNECTIONS=100 \
   wss-server
 ```
 
-With nginx TLS termination:
-
-```nginx
-# nginx.conf
-server {
-    listen 443 ssl;
-    ssl_certificate /certs/server.crt;
-    ssl_certificate_key /certs/server.key;
-
-    location / {
-        proxy_pass http://wss-server:8080;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
-    }
-}
-```
-
-### 2. wss-client
+### 2. Run Client
 
 ```bash
 # Build
@@ -73,19 +69,7 @@ cargo build --release
 # Run
 $env:WSS_RELAY_URL="wss://your-server:8443"
 $env:WSS_DOMAIN="app.internal"
-.\target\release\wss-client.exe
-```
-
-Or use .env:
-
-```powershell
-# .env
-WSS_RELAY_URL=wss://your-server:8443
-WSS_DOMAIN=app.internal
-```
-
-```powershell
-Get-Content .env | ForEach-Object { $name, $value = $_ -split '='; Set-Item -Path "env:$name" -Value $Value }
+$env:WSS_TOKEN="your-secret-token"
 .\wss-client.exe
 ```
 
@@ -100,14 +84,9 @@ Get-Content .env | ForEach-Object { $name, $value = $_ -split '='; Set-Item -Pat
 | `WSS_TOKEN` | Authentication token | (required) |
 | `WSS_MAX_CONNECTIONS` | Max connections per IP | `100` |
 
-Format: `domain1=target1,domain2=target2`
-
 ```bash
-# Multiple routes
-WSS_ROUTES=app1.internal=10.0.0.1:443,app2.internal=10.0.0.2:3389
-
-# Example with all vars
-WSS_ROUTES=app.internal=10.0.0.1:443
+# Example
+WSS_ROUTES=app.internal=10.0.0.1:443,app2.internal=10.0.0.2:3389
 WSS_TOKEN=your-secret-token
 WSS_MAX_CONNECTIONS=50
 ```
@@ -131,41 +110,101 @@ WSS_TOKEN=your-secret-token
 
 ### 10.x.x.x Enforcement
 
-Server only allows connections totargets starting with `10.`:
+Server validates IP properly (not just string prefix):
 
-- `10.0.0.1:443` ✅ Allowed (HTTPS)
+```rust
+fn validate_10_network(target: &str) -> bool {
+    let (host, _) = target.rsplit_once(':').unwrap_or((target, ""));
+    let ip: IpAddr = host.parse()?;
+    
+    match ip {
+        IpAddr::V4(v4) => v4.octets()[0] == 10,
+        IpAddr::V6(_) => false,
+    }
+}
+```
+
+- `10.0.0.1:443` ✅ Allowed
 - `192.168.1.1:443` ❌ Denied
-- `any-other:443` ❌ Denied
+- `anything` ❌ Denied
 
-### TLS Flow
+### Rate Limiting
+
+- Max connections per IP (default: 100)
+- 60-second sliding window
+- Configurable via `WSS_MAX_CONNECTIONS`
+
+### Authentication
+
+First message must be JSON:
+
+```json
+{
+  "type": "auth",
+  "token": "your-secret-token",
+  "domain": "app.internal"
+}
+```
+
+Server responds:
+
+```json
+{"type": "ok", "session_id": "uuid-here"}
+```
+
+## Performance
+
+| Metric | Value |
+|--------|-------|
+| Throughput | 300Mbps+ |
+| Buffer Size | 64KB |
+| Latency | Low (direct tunnel) |
+
+### Expected Transfer Times (300Mbps)
+
+| File Size | Time |
+|----------|------|
+| 100 MB | ~3 sec |
+| 1 GB | ~27 sec |
+| 10 GB | ~4.5 min |
+
+## Reconnect Logic
+
+Client automatically reconnects on disconnect:
+
+- Initial backoff: 1 second
+- Exponential: 1s → 2s → 4s → 8s → ...
+- Max backoff: 30 seconds
+- Infinite retries (configurable)
+
+## Logging
+
+Server logs include session ID, domain, and client IP:
 
 ```
-Client → wss:// (TLS) → Server → 10.x.x.x:443 (HTTPS)
-                       → Target uses HTTPS (port 443)
+[session-id] [domain] [ip] Connected
+[session-id] [domain] Disconnected
+[session-id] [domain] Error: message
 ```
-
-All traffic is encrypted:
-1. Client → Server: TLS (wss://)
-2. Server → Target: HTTPS (port 443) with TLS
 
 ## Use Cases
 
-### 1. Access Internal Web App
+### Access Internal Web App
 
 ```powershell
-# On local PC
 $env:WSS_RELAY_URL="wss://your-server.com:8443"
 $env:WSS_DOMAIN="internal.yourcompany.com"
+$env:WSS_TOKEN="your-secret-token"
+
 .\wss-client.exe
 
-# Now open browser
+# Open browser
 Start-Process "https://internal.yourcompany.com"
 ```
 
-### 2. SSH over WebSocket
+### SSH over WebSocket
 
 ```powershell
-# Configure SSH to use local port
 # SSH config
 Host internal
     HostName localhost
@@ -173,26 +212,25 @@ Host internal
     User youruser
     LocalForward 2222 internal.yourcompany.com:22
 
-# In terminal 1 - start tunnel
+# Terminal 1
 .\wss-client.exe
 
-# In terminal 2 - SSH
+# Terminal 2
 ssh -p 2222 localhost
 ```
 
-### 3. RDP over WebSocket
+### RDP over WebSocket
 
 ```powershell
-# Connect to internal Windows via RDP
 $env:WSS_RELAY_URL="wss://your-server.com:8443"
 $env:WSS_DOMAIN="10.0.0.100:3389"
+$env:WSS_TOKEN="your-secret-token"
 
-# Use RDP client to connect to localhost:3389
 .\wss-client.exe
 mstsc.exe
 ```
 
-## Docker Compose Example
+## Docker Compose
 
 ```yaml
 version: '3.8'
@@ -204,6 +242,8 @@ services:
       - "8080:8080"
     environment:
       - WSS_ROUTES=app.internal=10.0.0.1:443
+      - WSS_TOKEN=your-secret-token
+      - WSS_MAX_CONNECTIONS=100
     networks:
       - internal
 
@@ -224,56 +264,51 @@ networks:
     driver: bridge
 ```
 
-## Troubleshooting
+## Nginx TLS Termination
 
-### Connection Refused
+```nginx
+server {
+    listen 443 ssl;
+    ssl_certificate /certs/server.crt;
+    ssl_certificate_key /certs/server.key;
 
-```bash
-# Check server is running
-docker ps
-
-# Check logs
-docker logs <container>
-
-# Check port
-curl http://localhost:8080
+    location / {
+        proxy_pass http://wss-server:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+    }
+}
 ```
+
+## Troubleshooting
 
 ### DENIED Response
 
-- Target must start with `10.`
+- Check target is in 10.x.x.x network
 - Check `WSS_ROUTES` format
 
-### TLS Errors
+### Authentication Failed
 
-- For self-signed certs, install cert in Windows trust store
-- Or use browser to accept cert manually
+- Ensure `WSS_TOKEN` matches server
 
-## Performance
+### Rate Limit Exceeded
 
-| Metric | Value |
-|--------|-------|
-| Throughput | 300Mbps+ |
-| Buffer Size | 64KB |
-| Latency | Low (direct tunnel) |
+- Lower `WSS_MAX_CONNECTIONS` or wait 60 seconds
 
-### Expected Transfer Times (300Mbps)
-
-| File Size | Time |
-|----------|------|
-| 100 MB | ~3 sec |
-| 1 GB | ~27 sec |
-| 10 GB | ~4.5 min |
-
-Note: Actual speed depends on your network bandwidth and TLS overhead.
+## Dependencies
 
 ### wss-server
 
 ```toml
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "sync"] }
 tokio-tungstenite = "0.21"
 futures-util = "0.3"
 anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
 ```
 
 ### wss-client
@@ -283,6 +318,8 @@ tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.21"
 futures-util = "0.3"
 anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 ```
 
 ## License
