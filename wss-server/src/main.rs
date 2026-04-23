@@ -1,6 +1,7 @@
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use std::env;
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -38,6 +39,23 @@ fn resolve_target(routes: &[DomainRoute], domain: &str) -> Option<String> {
         .map(|r| r.target.clone())
 }
 
+fn validate_10_network(target: &str) -> Result<bool> {
+    let (host, _) = target
+        .rsplit_once(':')
+        .unwrap_or((target, ""));
+
+    let ip: IpAddr = host.parse()
+        .map_err(|e| anyhow::anyhow!("Invalid IP: {}", e))?;
+
+    match ip {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            Ok(octets[0] == 10)
+        }
+        IpAddr::V6(_) => Ok(false),
+    }
+}
+
 const BUFFER_SIZE: usize = 65536;
 
 async fn handle_connection(
@@ -60,55 +78,58 @@ async fn handle_connection(
     let target = resolve_target(&routes, &domain);
 
     match target {
-        Some(target_addr) if target_addr.starts_with("10.") => {
-            println!("Connecting to {}", target_addr);
-            ws_sender
-                .send(Message::Text("OK".into()))
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to send OK: {}", e))?;
+        Some(target_addr) => {
+            let is_valid = validate_10_network(&target_addr)?;
+            
+            if is_valid {
+                println!("Connecting to {}", target_addr);
+                ws_sender
+                    .send(Message::Text("OK".into()))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to send OK: {}", e))?;
 
-            let mut outbound = tokio::net::TcpStream::connect(&target_addr)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to connect to {}: {}", target_addr, e))?;
+                let mut outbound = tokio::net::TcpStream::connect(&target_addr)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to connect to {}: {}", target_addr, e))?;
 
-            let (mut ro, mut wo) = outbound.split();
+                let (mut ro, mut wo) = outbound.split();
 
-            let ws_to_tcp = async {
-                let mut buf = vec![0u8; BUFFER_SIZE];
-                while let Some(msg) = ws_receiver.next().await {
-                    let msg = msg.map_err(anyhow::Error::from)?;
-                    if msg.is_binary() {
-                        wo.write_all(&msg.into_data()).await.map_err(anyhow::Error::from)?;
-                    } else if msg.is_text() {
-                        wo.write_all(msg.to_text().unwrap().as_bytes()).await.map_err(anyhow::Error::from)?;
+                let ws_to_tcp = async {
+                    let mut buf = vec![0u8; BUFFER_SIZE];
+                    while let Some(msg) = ws_receiver.next().await {
+                        let msg = msg.map_err(anyhow::Error::from)?;
+                        if msg.is_binary() {
+                            wo.write_all(&msg.into_data()).await.map_err(anyhow::Error::from)?;
+                        } else if msg.is_text() {
+                            wo.write_all(msg.to_text().unwrap().as_bytes()).await.map_err(anyhow::Error::from)?;
+                        }
                     }
-                }
-                Ok::<_, anyhow::Error>(())
-            };
+                    Ok::<_, anyhow::Error>(())
+                };
 
-            let tcp_to_ws = async {
-                let mut buf = vec![0u8; BUFFER_SIZE];
-                loop {
-                    let n = ro.read(&mut buf).await.map_err(anyhow::Error::from)?;
-                    if n == 0 {
-                        break;
+                let tcp_to_ws = async {
+                    let mut buf = vec![0u8; BUFFER_SIZE];
+                    loop {
+                        let n = ro.read(&mut buf).await.map_err(anyhow::Error::from)?;
+                        if n == 0 {
+                            break;
+                        }
+                        ws_sender
+                            .send(Message::Binary(buf[..n].to_vec()))
+                            .await
+                            .map_err(anyhow::Error::from)?;
                     }
-                    ws_sender
-                        .send(Message::Binary(buf[..n].to_vec()))
-                        .await
-                        .map_err(anyhow::Error::from)?;
-                }
-                Ok::<_, anyhow::Error>(())
-            };
+                    Ok::<_, anyhow::Error>(())
+                };
 
-            tokio::try_join!(ws_to_tcp, tcp_to_ws)?;
-        }
-        Some(_) => {
-            ws_sender
-                .send(Message::Text("DENIED".into()))
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to send DENIED: {}", e))?;
-            anyhow::bail!("Target must be 10.x.x.x");
+                tokio::try_join!(ws_to_tcp, tcp_to_ws)?;
+            } else {
+                ws_sender
+                    .send(Message::Text("DENIED".into()))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to send DENIED: {}", e))?;
+                anyhow::bail!("Target must be in 10.x.x.x network");
+            }
         }
         None => {
             ws_sender
