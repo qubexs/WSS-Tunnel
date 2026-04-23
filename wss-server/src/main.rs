@@ -1,14 +1,17 @@
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::env;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::RwLock;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
+use uuid::Uuid;
 
 #[derive(Clone, Debug)]
 struct DomainRoute {
@@ -20,6 +23,7 @@ struct DomainRoute {
 struct AppState {
     routes: Arc<Vec<DomainRoute>>,
     token: String,
+    sessions: Arc<RwLock<HashMap<String, String>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -28,6 +32,15 @@ struct AuthMessage {
     msg_type: String,
     token: String,
     domain: Option<String>,
+}
+
+#[derive(Serialize)]
+struct WssMessage {
+    #[serde(rename = "type")]
+    msg_type: String,
+    session_id: Option<String>,
+    #[serde(flatten)]
+    extra: Option<serde_json::Value>,
 }
 
 fn parse_routes(routes_str: &str) -> Vec<DomainRoute> {
@@ -78,6 +91,7 @@ async fn handle_connection(
     state: Arc<AppState>,
 ) -> Result<()> {
     let (mut ws_sender, mut ws_receiver) = ws.split();
+    let mut session_id = String::new();
 
     let auth_msg = ws_receiver
         .next()
@@ -115,12 +129,23 @@ async fn handle_connection(
             let is_valid = validate_10_network(&target_addr)?;
             
             if is_valid {
+                session_id = Uuid::new_v4().to_string();
+
+                {
+                    let mut sessions = state.sessions.write().await;
+                    sessions.insert(session_id.clone(), domain.clone());
+                }
+
+                let ok_msg = serde_json::json!({
+                    "type": "ok",
+                    "session_id": session_id
+                });
                 ws_sender
-                    .send(Message::Text(r#"{"type":"ok"}"#.into()))
+                    .send(Message::Text(ok_msg.to_string().into()))
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to send OK: {}", e))?;
 
-                println!("[{}] Connecting to {}", domain, target_addr);
+                println!("[{}] [{}] Connected", session_id, domain);
 
                 let mut outbound = tokio::net::TcpStream::connect(&target_addr)
                     .await
@@ -155,7 +180,18 @@ async fn handle_connection(
                     Ok::<_, anyhow::Error>(())
                 };
 
-                tokio::try_join!(ws_to_tcp, tcp_to_ws)?;
+                let result = tokio::try_join!(ws_to_tcp, tcp_to_ws);
+
+                {
+                    let mut sessions = state.sessions.write().await;
+                    sessions.remove(&session_id);
+                }
+
+                if let Err(e) = result {
+                    eprintln!("[{}] [{}] Error: {}", session_id, domain, e);
+                } else {
+                    println!("[{}] [{}] Disconnected", session_id, domain);
+                }
             } else {
                 ws_sender
                     .send(Message::Text(r#"{"type":"error","message":"Denied: must be 10.x.x.x"}"#.into()))
@@ -186,6 +222,7 @@ async fn main() -> Result<()> {
     let state = Arc::new(AppState {
         routes,
         token: token.clone(),
+        sessions: Arc::new(RwLock::new(HashMap::new())),
     });
 
     let token_shown = format!("{}***", &token[..4.min(token.len())]);

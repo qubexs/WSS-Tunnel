@@ -1,5 +1,6 @@
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
 use serde::Serialize;
 use std::env;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, stdin, stdout};
@@ -14,6 +15,14 @@ struct AuthMessage {
     domain: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct AuthResponse {
+    #[serde(rename = "type")]
+    msg_type: String,
+    session_id: Option<String>,
+    message: Option<String>,
+}
+
 const MAX_RETRIES: u32 = 0;
 const INITIAL_BACKOFF_MS: u64 = 1000;
 const MAX_BACKOFF_MS: u64 = 30000;
@@ -22,7 +31,7 @@ async fn connect_and_tunnel(
     relay_url: &str,
     domain: &str,
     token: &str,
-) -> Result<()> {
+) -> Result<String> {
     let (ws_stream, _) = connect_async(relay_url).await
         .map_err(|e| anyhow::anyhow!("Failed to connect: {}", e))?;
 
@@ -43,14 +52,15 @@ async fn connect_and_tunnel(
         .ok_or_else(|| anyhow::anyhow!("No response from server"))??;
 
     let resp_text = response.to_text().unwrap_or("");
-    if resp_text.contains("error") {
-        anyhow::bail!("Server error: {}", resp_text);
-    }
-    if !resp_text.contains("ok") && resp_text != "OK" {
-        anyhow::bail!("Authentication failed: {}", resp_text);
+    let auth_resp: AuthResponse = serde_json::from_str(resp_text)
+        .map_err(|e| anyhow::anyhow!("Invalid response: {}", e))?;
+
+    if auth_resp.msg_type == "error" {
+        anyhow::bail!("Server error: {}", auth_resp.message.unwrap_or_default());
     }
 
-    println!("Tunnel open.");
+    let session_id = auth_resp.session_id.unwrap_or_else(|| "unknown".to_string());
+    println!("Tunnel open [{}].", session_id);
 
     let mut stdin = stdin();
     let mut stdout = stdout();
@@ -87,7 +97,7 @@ async fn connect_and_tunnel(
 
     tokio::try_join!(stdin_to_ws, ws_to_stdout)?;
 
-    Ok(())
+    Ok(session_id)
 }
 
 #[tokio::main]
@@ -108,8 +118,8 @@ async fn main() -> Result<()> {
 
     loop {
         match connect_and_tunnel(&relay_url, &domain, &token).await {
-            Ok(_) => {
-                println!("Tunnel closed cleanly.");
+            Ok(session_id) => {
+                println!("[{}] Tunnel closed.", session_id);
                 break;
             }
             Err(e) => {
