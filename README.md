@@ -97,12 +97,19 @@ Get-Content .env | ForEach-Object { $name, $value = $_ -split '='; Set-Item -Pat
 |---------|------------|---------|
 | `WSS_LISTEN` | Listen address | `0.0.0.0:8080` |
 | `WSS_ROUTES` | Domain→target mappings | (required) |
+| `WSS_TOKEN` | Authentication token | (required) |
+| `WSS_MAX_CONNECTIONS` | Max connections per IP | `100` |
 
 Format: `domain1=target1,domain2=target2`
 
 ```bash
 # Multiple routes
 WSS_ROUTES=app1.internal=10.0.0.1:443,app2.internal=10.0.0.2:3389
+
+# Example with all vars
+WSS_ROUTES=app.internal=10.0.0.1:443
+WSS_TOKEN=your-secret-token
+WSS_MAX_CONNECTIONS=50
 ```
 
 ### wss-client
@@ -111,11 +118,13 @@ WSS_ROUTES=app1.internal=10.0.0.1:443,app2.internal=10.0.0.2:3389
 |---------|------------|---------|
 | `WSS_RELAY_URL` | Server WebSocket URL | (required) |
 | `WSS_DOMAIN` | Domain to tunnel to | (required) |
+| `WSS_TOKEN` | Authentication token | (required) |
 
 ```bash
 # Example
 WSS_RELAY_URL=wss://relay.example.com:8443
 WSS_DOMAIN=app.internal
+WSS_TOKEN=your-secret-token
 ```
 
 ## Security
