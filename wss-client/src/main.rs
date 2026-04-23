@@ -1,8 +1,17 @@
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
+use serde::Serialize;
 use std::env;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, stdin, stdout};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+#[derive(Serialize)]
+struct AuthMessage {
+    #[serde(rename = "type")]
+    msg_type: String,
+    token: String,
+    domain: String,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -10,6 +19,8 @@ async fn main() -> Result<()> {
         .expect("WSS_RELAY_URL not set");
     let domain = env::var("WSS_DOMAIN")
         .expect("WSS_DOMAIN not set");
+    let token = env::var("WSS_TOKEN")
+        .expect("WSS_TOKEN not set");
 
     println!("Connecting to relay: {}", relay_url);
     println!("Tunneling domain: {}", domain);
@@ -19,19 +30,29 @@ async fn main() -> Result<()> {
 
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
-    ws_sender.send(Message::Text(domain.into())).await
-        .map_err(|e| anyhow::anyhow!("Failed to send domain: {}", e))?;
+    let auth = AuthMessage {
+        msg_type: "auth".to_string(),
+        token,
+        domain: domain.clone(),
+    };
+    let auth_json = serde_json::to_string(&auth)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize auth: {}", e))?;
+
+    ws_sender.send(Message::Text(auth_json.into())).await
+        .map_err(|e| anyhow::anyhow!("Failed to send auth: {}", e))?;
 
     let response = ws_receiver.next().await
         .ok_or_else(|| anyhow::anyhow!("No response from server"))??;
 
-    if let Message::Text(text) = response {
-        if text.as_str() == "DENIED" {
-            anyhow::bail!("Access denied by relay server");
-        }
+    let resp_text = response.to_text().unwrap_or("");
+    if resp_text.contains("error") {
+        anyhow::bail!("Server error: {}", resp_text);
+    }
+    if !resp_text.contains("ok") && resp_text != "OK" {
+        anyhow::bail!("Authentication failed: {}", resp_text);
     }
 
-    println!("Connected! Tunnel open.");
+    println!("Authenticated! Tunnel open.");
 
     let mut stdin = stdin();
     let mut stdout = stdout();

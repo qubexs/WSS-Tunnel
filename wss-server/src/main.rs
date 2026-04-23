@@ -1,5 +1,6 @@
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
 use std::env;
 use std::net::IpAddr;
 use std::net::SocketAddr;
@@ -13,6 +14,20 @@ use tokio_tungstenite::tungstenite::Message;
 struct DomainRoute {
     domain: String,
     target: String,
+}
+
+#[derive(Clone)]
+struct AppState {
+    routes: Arc<Vec<DomainRoute>>,
+    token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthMessage {
+    #[serde(rename = "type")]
+    msg_type: String,
+    token: String,
+    domain: Option<String>,
 }
 
 fn parse_routes(routes_str: &str) -> Vec<DomainRoute> {
@@ -60,33 +75,52 @@ const BUFFER_SIZE: usize = 65536;
 
 async fn handle_connection(
     ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-    routes: Arc<Vec<DomainRoute>>,
+    state: Arc<AppState>,
 ) -> Result<()> {
     let (mut ws_sender, mut ws_receiver) = ws.split();
 
-    let domain_msg = ws_receiver
+    let auth_msg = ws_receiver
         .next()
         .await
-        .ok_or_else(|| anyhow::anyhow!("No domain received"))??;
+        .ok_or_else(|| anyhow::anyhow!("No auth message received"))??;
 
-    let domain = match domain_msg {
-        Message::Text(text) => text.to_string(),
-        Message::Binary(data) => String::from_utf8_lossy(&data).to_string(),
+    let auth: AuthMessage = match auth_msg {
+        Message::Text(text) => {
+            serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("Invalid auth format: {}", e))?
+        }
+        Message::Binary(data) => {
+            let text = String::from_utf8_lossy(&data);
+            serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("Invalid auth format: {}", e))?
+        }
         _ => anyhow::bail!("Invalid first message"),
     };
 
-    let target = resolve_target(&routes, &domain);
+    if auth.msg_type != "auth" {
+        anyhow::bail!("First message must be auth");
+    }
+
+    if auth.token != state.token {
+        ws_sender
+            .send(Message::Text(r#"{"type":"error","message":"Invalid token"}"#.into()))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to send error: {}", e))?;
+        anyhow::bail!("Invalid token");
+    }
+
+    let domain = auth.domain.ok_or_else(|| anyhow::anyhow!("No domain in auth message"))?;
+    let target = resolve_target(&state.routes, &domain);
 
     match target {
         Some(target_addr) => {
             let is_valid = validate_10_network(&target_addr)?;
             
             if is_valid {
-                println!("Connecting to {}", target_addr);
                 ws_sender
-                    .send(Message::Text("OK".into()))
+                    .send(Message::Text(r#"{"type":"ok"}"#.into()))
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to send OK: {}", e))?;
+
+                println!("[{}] Connecting to {}", domain, target_addr);
 
                 let mut outbound = tokio::net::TcpStream::connect(&target_addr)
                     .await
@@ -95,7 +129,6 @@ async fn handle_connection(
                 let (mut ro, mut wo) = outbound.split();
 
                 let ws_to_tcp = async {
-                    let mut buf = vec![0u8; BUFFER_SIZE];
                     while let Some(msg) = ws_receiver.next().await {
                         let msg = msg.map_err(anyhow::Error::from)?;
                         if msg.is_binary() {
@@ -125,7 +158,7 @@ async fn handle_connection(
                 tokio::try_join!(ws_to_tcp, tcp_to_ws)?;
             } else {
                 ws_sender
-                    .send(Message::Text("DENIED".into()))
+                    .send(Message::Text(r#"{"type":"error","message":"Denied: must be 10.x.x.x"}"#.into()))
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to send DENIED: {}", e))?;
                 anyhow::bail!("Target must be in 10.x.x.x network");
@@ -133,7 +166,7 @@ async fn handle_connection(
         }
         None => {
             ws_sender
-                .send(Message::Text("NOT_FOUND".into()))
+                .send(Message::Text(r#"{"type":"error","message":"Domain not found"}"#.into()))
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to send NOT_FOUND: {}", e))?;
             anyhow::bail!("Domain not found: {}", domain);
@@ -147,9 +180,17 @@ async fn handle_connection(
 async fn main() -> Result<()> {
     let listen = env::var("WSS_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let routes_str = env::var("WSS_ROUTES").expect("WSS_ROUTES not set");
+    let token = env::var("WSS_TOKEN").expect("WSS_TOKEN not set");
 
     let routes = Arc::new(parse_routes(&routes_str));
-    println!("Routes: {:?}", routes);
+    let state = Arc::new(AppState {
+        routes,
+        token: token.clone(),
+    });
+
+    let token_shown = format!("{}***", &token[..4.min(token.len())]);
+    println!("Token configured: {}", token_shown);
+    println!("Routes: {:?}", state.routes);
 
     let addr: SocketAddr = listen.parse()?;
     let listener = TcpListener::bind(addr).await?;
@@ -159,12 +200,12 @@ async fn main() -> Result<()> {
 
     loop {
         let (stream, addr) = listener.accept().await?;
-        let routes = routes.clone();
+        let state = state.clone();
 
         tokio::spawn(async move {
             match accept_async(stream).await {
                 Ok(ws) => {
-                    if let Err(e) = handle_connection(ws, routes).await {
+                    if let Err(e) = handle_connection(ws, state).await {
                         eprintln!("Connection error {}: {}", addr, e);
                     }
                 }
