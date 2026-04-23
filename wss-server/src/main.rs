@@ -38,6 +38,8 @@ fn resolve_target(routes: &[DomainRoute], domain: &str) -> Option<String> {
         .map(|r| r.target.clone())
 }
 
+const BUFFER_SIZE: usize = 65536;
+
 async fn handle_connection(
     ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
     routes: Arc<Vec<DomainRoute>>,
@@ -72,6 +74,7 @@ async fn handle_connection(
             let (mut ro, mut wo) = outbound.split();
 
             let ws_to_tcp = async {
+                let mut buf = vec![0u8; BUFFER_SIZE];
                 while let Some(msg) = ws_receiver.next().await {
                     let msg = msg.map_err(anyhow::Error::from)?;
                     if msg.is_binary() {
@@ -84,7 +87,7 @@ async fn handle_connection(
             };
 
             let tcp_to_ws = async {
-                let mut buf = [0u8; 8192];
+                let mut buf = vec![0u8; BUFFER_SIZE];
                 loop {
                     let n = ro.read(&mut buf).await.map_err(anyhow::Error::from)?;
                     if n == 0 {

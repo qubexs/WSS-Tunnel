@@ -1,7 +1,7 @@
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use std::env;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, stdin, stdout};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 #[tokio::main]
@@ -33,11 +33,13 @@ async fn main() -> Result<()> {
 
     println!("Connected! Tunnel open.");
 
-    let mut stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
+    let mut stdin = stdin();
+    let mut stdout = stdout();
+
+    const BUFFER_SIZE: usize = 65536;
 
     let stdin_to_ws = async {
-        let mut buf = [0u8; 4096];
+        let mut buf = vec![0u8; BUFFER_SIZE];
         loop {
             let n = stdin.read(&mut buf).await.map_err(anyhow::Error::from)?;
             if n == 0 { break; }
@@ -47,6 +49,7 @@ async fn main() -> Result<()> {
     };
 
     let ws_to_stdout = async {
+        let mut buf = vec![0u8; BUFFER_SIZE];
         while let Some(msg) = ws_receiver.next().await {
             let msg = msg.map_err(anyhow::Error::from)?;
             match msg {
